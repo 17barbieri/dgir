@@ -1,7 +1,7 @@
 # [Guiding Registration with Emergent Similarity from Pre-Trained Diffusion Models](https://arxiv.org/abs/2506.02419) (MICCAI 2025 Spotlight)
 
 
-A PyTorch implementation of diffusion-regularized neural networks for medical image registration, supporting both 2D and 3D registration.
+A PyTorch implementation of Diffusion Guided Image Registration (DGIR), supporting both 2D and 3D registration.
 
 ### Dependencies
 
