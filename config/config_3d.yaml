@@ -1,0 +1,72 @@
+# Configuration file for 3D diffusion registration
+
+# Training parameters
+training:
+  epochs: 100000
+  batch_size: 2  # Smaller batch size for 3D due to memory constraints
+  learning_rate: 1.0e-4
+  print_every: 10
+  save_every: 50000
+  device: "cuda"
+
+# Model configuration
+model:
+  dimension: 3  # 3D registration
+  image_size: 224  # Not directly used for 3D
+  num_multiscale_levels: 3
+  
+# Network architecture
+network:
+  unet_channels: [2, 16, 32, 64, 256, 512]
+  use_batch_norm: true
+  dropout_rate: 0.0
+
+# Diffusion model settings
+diffusion:
+  model_path: "guided_diffusion/256x256_diffusion_uncond.pt"
+  image_size: 256
+  class_cond: false
+  learn_sigma: true
+  num_channels: 256
+  num_res_blocks: 2
+  channel_mult: ""
+  num_heads: 4
+  num_head_channels: 64
+  attention_resolutions: "32,16,8"
+  dropout: 0.0
+  diffusion_steps: 1000
+  noise_schedule: "linear"
+  timestep_respacing: ""
+  use_kl: false
+  predict_xstart: false
+  rescale_timesteps: false
+  rescale_learned_sigmas: false
+  use_checkpoint: false
+  use_scale_shift_norm: true
+  resblock_updown: true
+  use_fp16: false
+  use_new_attention_order: false
+
+# Loss function settings
+loss:
+  type: "NewLNCC3D"  # 3D version of NewLNCC
+  sigma: 5  # Slightly larger sigma for 3D
+  lambda_regularization: 0.5  # From your original train3d.py
+  eps: 1.0e-6
+
+# Data settings for 3D OASIS dataset
+data:
+  data_root: "/path-to-OASIS"
+  max_subjects: 300
+  normalize_images: false  # OASIS data may not need normalization
+  
+# 3D-specific data configuration
+data_3d:
+  data_pattern: "/path-to-OASIS/OASIS_OAS1_{:04d}_MR1/aligned_{}.nii.gz"
+  input_shape: [1, 1, 224, 192, 160]  # Standard 3D shape
+
+# Output settings
+output:
+  checkpoint_dir: "checkpoints_3d"
+  log_dir: "logs_3d"
+  results_dir: "results_3d"

@@ -1,0 +1,77 @@
+# Configuration file for diffusion registration
+
+# Training parameters
+training:
+  epochs: 50000
+  batch_size: 4
+  learning_rate: 1.0e-4
+  print_every: 100
+  save_every: 10000
+  device: "cuda"  # or "cpu"
+
+# Model configuration
+model:
+  dimension: 2  # 2 or 3 for 2D/3D registration
+  image_size: 256
+  num_multiscale_levels: 3
+  
+# Network architecture
+network:
+  unet_channels: [2, 16, 32, 64, 256, 512]
+  use_batch_norm: true
+  dropout_rate: 0.0
+
+# Diffusion model settings
+diffusion:
+  model_path: "guided_diffusion/256x256_diffusion_uncond.pt"
+  image_size: 256
+  class_cond: false
+  learn_sigma: true
+  num_channels: 256
+  num_res_blocks: 2
+  channel_mult: ""
+  num_heads: 4
+  num_head_channels: 64
+  num_heads_upsample: -1
+  attention_resolutions: "32,16,8"
+  dropout: 0.0
+  diffusion_steps: 1000
+  noise_schedule: "linear"
+  timestep_respacing: ""
+  use_kl: false
+  predict_xstart: false
+  rescale_timesteps: false
+  rescale_learned_sigmas: false
+  use_checkpoint: false
+  use_scale_shift_norm: true
+  resblock_updown: true
+  use_fp16: false
+  use_new_attention_order: false
+
+# Loss function settings
+loss:
+  type: "NewLNCC"  # Options: "LNCC", "NewLNCC", "NCC", "SSD", "MINDSSC", "NMI"
+  sigma: 4  # For LNCC/NewLNCC
+  lambda_regularization: 1.0
+  eps: 1.0e-6
+
+# Data settings
+data:
+  data_root: "/path/to/your/preprocessed_data"
+  weird_xrays: []
+  normalize_images: true
+  
+# Paths for 2D data (example configuration)
+data_2d:
+  train:
+    dxa_with_seg: "affine_dxa_images_w_seg.pt"
+    xray_with_seg: "affine_radio_images_w_seg.pt"
+    dxa_without_seg: "affine_dxa_images_wo_seg.pt"
+    xray_without_seg: "affine_radio_images_wo_seg.pt"
+  
+
+# Output settings
+output:
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+  results_dir: "results"
