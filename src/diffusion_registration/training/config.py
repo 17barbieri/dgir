@@ -80,6 +80,9 @@ class LossConfig:
 class DataConfig:
     """Data loading configuration."""
     data_root: str = ""
+    train_dset: str = ""
+    val_dset: str = ""
+    test_dset: str = ""
     weird_xrays: List[int] = None
     normalize_images: bool = True
     

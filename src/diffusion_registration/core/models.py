@@ -64,15 +64,16 @@ def setup_diffusion_model(config: Config) -> Tuple[Any, Any]:
     )
     
     # Load pretrained weights
-    model_path = Path(config.diffusion.model_path)
-    if not model_path.exists():
-        raise FileNotFoundError(f"Diffusion model checkpoint not found: {model_path}")
+    print('Temporarily not loading the checkpoint')
+    # model_path = Path(config.diffusion.model_path)
+    # if not model_path.exists():
+    #     raise FileNotFoundError(f"Diffusion model checkpoint not found: {model_path}")
     
-    try:
-        state_dict = torch.load(model_path, map_location="cpu")
-        model.load_state_dict(state_dict)
-    except Exception as e:
-        raise RuntimeError(f"Failed to load diffusion model from {model_path}: {e}") from e
+    # try:
+    #     state_dict = torch.load(model_path, map_location="cpu")
+    #     model.load_state_dict(state_dict)
+    # except Exception as e:
+    #     raise RuntimeError(f"Failed to load diffusion model from {model_path}: {e}") from e
     
     return model, diffusion
 
