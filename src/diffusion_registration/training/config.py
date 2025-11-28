@@ -10,11 +10,12 @@ from pathlib import Path
 @dataclass
 class TrainingConfig:
     """Training configuration parameters."""
-    epochs: int = 50000
+    epochs: int = 100
+    early_stopping_patience: int = 10
     batch_size: int = 4
     learning_rate: float = 1e-4
     print_every: int = 100
-    save_every: int = 10000
+    save_every: int = 5
     device: str = "cuda"
 
 
@@ -29,13 +30,14 @@ class ModelConfig:
 @dataclass
 class NetworkConfig:
     """Network architecture parameters."""
-    unet_channels: List[int] = None
-    use_batch_norm: bool = True
-    dropout_rate: float = 0.0
+    pass
+    # unet_channels: List[int] = None
+    # use_batch_norm: bool = True
+    # dropout_rate: float = 0.0
     
-    def __post_init__(self):
-        if self.unet_channels is None:
-            self.unet_channels = [2, 16, 32, 64, 256, 512]
+    # def __post_init__(self):
+    #     if self.unet_channels is None:
+    #         self.unet_channels = [2, 16, 32, 64, 256, 512]
 
 
 @dataclass
@@ -116,10 +118,10 @@ class Config:
         self.loss = LossConfig()
         self.data = DataConfig()
         self.output = OutputConfig()
-        
+
         if config_path is not None:
             self.load_from_yaml(config_path)
-    
+
     def load_from_yaml(self, config_path: Union[str, Path]) -> None:
         """
         Load configuration from YAML file.

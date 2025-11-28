@@ -11,15 +11,14 @@ import sys
 import os
 import random
 import glob
+import re
 from pathlib import Path
+import traceback
 import numpy as np
 import pandas as pd
 import nibabel as nib
-from scipy.ndimage import zoom
-from nibabel.processing import resample_from_to
 from tqdm import tqdm
 import torch
-import itk
 import matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
@@ -31,183 +30,162 @@ from diffusion_registration.training.config import Config
 from diffusion_registration.core.models import setup_diffusion_model, setup_registration_net
 from diffusion_registration.core import networks, wrappers, losses
 
-def nib_load(path, raw = True, dtype = np.float32, orientation=('R', 'A', 'S')):
-    """ Loads Nifti volumes and reorients them in ()'R', 'A', 'S')"""
-    volume = nib.load(path)
+from standard_utils import *
 
-    wanted_orientation = nib.orientations.axcodes2ornt(orientation)
-    current_orientation = nib.orientations.io_orientation(volume.affine)
-    if np.any(current_orientation != wanted_orientation):
-        transformation = nib.orientations.ornt_transform(current_orientation, wanted_orientation)
-        volume = volume.as_reoriented(transformation)
-    volume = nib.Nifti1Image(volume.get_fdata().astype(dtype), affine = volume.affine, header = volume.header)
-
-    if raw:
-        return volume
-    return volume, volume.get_fdata()
-
-def zscore_normalize(volume_nib: nib.nifti1.Nifti1Image, eps=1e-8,
-                     target_shape = (256, 256, 75)) -> np.ndarray:
-    """Apply zscore normalization and reshape data"""
-    # compute mean / std only over non-zero voxels (common for brain MRI)
-    volume = volume_nib.get_fdata().copy()
-    mask = volume != 0
-    if mask.sum() == 0:
-        v = volume
-        mean = v.mean()
-        std = v.std()
-    else:
-        v = volume[mask]
-        mean = v.mean()
-        std = v.std()
-    if std < eps:
-        std = eps
-    out = (volume - mean) / std
-    # clip extreme values for stability
-    out = np.clip(out, -5.0, 5.0)
-
-    # Resize if target_shape is given
-    if target_shape is not None:
-        zoom_factors = [t/s for t,s in zip(target_shape, out.shape)]
-        out = zoom(out, zoom_factors, order=1)
-    return out.astype(np.float32)
-
-def dipy_resample(moving_img, fixed_img, moving_seg = None):
+def dice_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     """
-    Resample a moving image and its segmentation to match a fixed image
-    in world space, including orientation, origin, and spacing.
-
-    Parameters
-    ----------
-    moving_img : nib.Nifti1Image
-        Moving image to resample.
-    moving_seg : nib.Nifti1Image
-        Moving segmentation (integer labels).
-    fixed_img : nib.Nifti1Image
-        Fixed image that defines the target space.
-    interp_type : str
-        Interpolation type for image: 'linear' or 'nearest' (segmentation uses nearest).
-
-    Returns
-    -------
-    resampled_data : np.ndarray
-        Resampled moving image data (float).
-    resampled_affine : np.ndarray
-        Affine of resampled moving image.
-    resampled_seg : np.ndarray
-        Resampled segmentation data (int).
+    Compute Dice score between two binary masks.
+    
+    Args:
+        y_true: Ground truth mask (0s and 1s)
+        y_pred: Predicted mask (0s and 1s)
+    
+    Returns:
+        Dice coefficient (float between 0 and 1)
     """
+    y_true = y_true.astype(bool)
+    y_pred = y_pred.astype(bool)
+    
+    intersection = np.logical_and(y_true, y_pred).sum()
+    total = y_true.sum() + y_pred.sum()
+    
+    if total == 0:
+        return 1.0  # both empty masks → perfect overlap
+    return 2 * intersection / total
 
-    # 1. Resample the moving image to fixed image using world-space alignment
-    # order = 1 --> Linear for image
-    resampled_moving_img = resample_from_to(moving_img, fixed_img, order=1)
+def compute_metric(fixed_seg, moving_seg):
+    if isinstance(fixed_seg, nib.nifti1.Nifti1Image):
+        fixed_seg = fixed_seg.get_fdata()
+    if isinstance(moving_seg, nib.nifti1.Nifti1Image):
+        moving_seg = moving_seg.get_fdata()
+    dices_per_label = []
+    for current_label in np.unique(fixed_seg):
+        if current_label != 0:
+            mask1 = fixed_seg == current_label
+            mask2 = moving_seg == current_label
+            dices_per_label.append(round(float(dice_score(mask1, mask2)), 3))
 
-    # 2. Resample the segmentation (nearest neighbor)
-    if moving_seg is not None:
-        # order = 0 --> Nearest-neighbor for segmentation
-        resampled_moving_seg = resample_from_to(moving_seg, fixed_img, order=0)
-
-        return resampled_moving_img, resampled_moving_seg
-    return resampled_moving_img
+    mask1 = fixed_seg > 0
+    mask2 = moving_seg > 0
+    global_dice = dice_score(mask1, mask2)
+    avg_dice = np.mean(dices_per_label)
+    return global_dice, avg_dice, dices_per_label
 
 class NiftiDataset(Dataset):
     """CSV with: Fixed path, Moving path, Fixed seg path, Moving seg path"""
-    def __init__(self, csv_path, mode = 'train'):
+    def __init__(self, csv_path, mode = 'train', target_shape = (224, 192, 160),
+                 temp_save_path = './preproc_data'):
         self.dset = pd.read_csv(csv_path)
         self.mode = mode
+        self.target_shape = target_shape
+        self.temp_save_path = os.path.join(temp_save_path, mode)
+        os.makedirs(self.temp_save_path, exist_ok = True)
 
     def __len__(self):
         return len(self.dset)
 
-    def __getitem__(self, idx):
-        target_shape = (224, 192, 160)
+    def pad_or_crop_center(self, arr, target_shape, pad_value=0):
+        """
+        Pads or crops a 3D tensor (B, C, D, H, W) to match target_shape (D, H, W).
+        """
+        _, _, d, h, w = arr.shape
+        td, th, tw = target_shape
 
-        fixed_nib = nib_load(self.dset['Fixed path'].iloc[idx])
-        moving_nib = nib_load(self.dset['Moving path'].iloc[idx])
+        # Pad or crop depth
+        pad_d = max(td - d, 0)
+        pad_h = max(th - h, 0)
+        pad_w = max(tw - w, 0)
+
+        # Pad equally on both sides
+        pad = (pad_w // 2, pad_w - pad_w // 2,
+            pad_h // 2, pad_h - pad_h // 2,
+            pad_d // 2, pad_d - pad_d // 2)
+        arr = F.pad(arr, pad, mode='constant', value=pad_value)
+
+        # Crop if needed (center crop)
+        _, _, d, h, w = arr.shape
+        start_d = (d - td) // 2
+        start_h = (h - th) // 2
+        start_w = (w - tw) // 2
+        arr = arr[:, :, start_d:start_d+td, start_h:start_h+th, start_w:start_w+tw]
+
+        return arr
+
+    def __getitem__(self, idx):
+        preproc_fixed_path = os.path.join(self.temp_save_path, f'{idx:03d}_fixed.pty')
+        preproc_moving_path = os.path.join(self.temp_save_path, f'{idx:03d}_moving.pty')
+        preproc_fixed_seg_path = os.path.join(self.temp_save_path, f'{idx:03d}_fixed_seg.pty')
+        preproc_moving_seg_path = os.path.join(self.temp_save_path, f'{idx:03d}_moving_seg.pty')
+        fixed_arr, fixed_seg_arr, moving_arr = None, None, None
+
+        if os.path.isfile(preproc_fixed_path) and os.path.isfile(preproc_moving_path):
+            fixed_crop_pad_tensor = torch.load(preproc_fixed_path)
+            moving_crop_pad_tensor = torch.load(preproc_moving_path)
+        if os.path.isfile(preproc_fixed_seg_path) and os.path.isfile(preproc_moving_seg_path):
+            fixed_seg_crop_pad_tensor = torch.load(preproc_fixed_seg_path)
+            moving_seg_crop_pad_tensor = torch.load(preproc_moving_seg_path)
 
         if self.mode == 'train':
-            moving_nib, _ = dipy_resample(moving_nib, moving_nib, fixed_nib)
-            fixed_arr = zscore_normalize(fixed_nib)
-            moving_arr = zscore_normalize(moving_nib)
-            fixed_arr = torch.from_numpy(fixed_arr).unsqueeze(0).unsqueeze(0)
-            moving_arr = torch.from_numpy(moving_arr).unsqueeze(0).unsqueeze(0)
-            fixed_arr = F.interpolate(fixed_arr, size=target_shape, mode='trilinear', align_corners=False).squeeze(1)
-            moving_arr = F.interpolate(moving_arr, size=target_shape, mode='trilinear', align_corners=False).squeeze(1)
-            return {'fixed_arr': fixed_arr, 'moving_arr': moving_arr}
-        elif self.mode =='val':
-            fixed_seg_nib = nib_load(self.dset['Fixed seg path'].iloc[idx])
-            moving_seg_nib = nib_load(self.dset['Moving seg path'].iloc[idx])
-            moving_nib, moving_seg_nib = dipy_resample(moving_nib, moving_seg_nib, fixed_nib)
-            fixed_arr = zscore_normalize(fixed_nib)
-            moving_arr = zscore_normalize(moving_nib)
-            fixed_arr = torch.from_numpy(fixed_arr).unsqueeze(0).unsqueeze(0)
-            fixed_seg_arr = torch.from_numpy(fixed_seg_nib.get_fdata()).unsqueeze(0).unsqueeze(0)
-            moving_arr = torch.from_numpy(moving_arr).unsqueeze(0).unsqueeze(0)
-            moving_seg_arr = torch.from_numpy(moving_seg_nib.get_fdata()).unsqueeze(0).unsqueeze(0)
-            fixed_arr = F.interpolate(fixed_arr, size=target_shape, mode='trilinear', align_corners=False).squeeze(1)
-            moving_arr = F.interpolate(moving_arr, size=target_shape, mode='trilinear', align_corners=False).squeeze(1)
-            fixed_seg_arr = F.interpolate(fixed_seg_arr, size=target_shape, mode='trilinear', align_corners=False).squeeze(1)
-            moving_seg_arr = F.interpolate(moving_seg_arr, size=target_shape, mode='trilinear', align_corners=False).squeeze(1)
-            return {'fixed_arr': fixed_arr, 'fixed_seg': fixed_seg_arr,
-                    'moving_arr': moving_arr,
-                    'moving_seg_arr': moving_seg_arr}
+            if fixed_arr is None:
+                fixed_nib = nib_load(self.dset['Fixed path'].iloc[idx])
+                moving_nib = nib_load(self.dset['Moving path'].iloc[idx])
+                
+                fixed_matched_nib, moving_matched_nib = match_nii_images(fixed_nib, moving_nib)
 
-def load_3d_oasis_data(max_subjects=300, data_pattern=None):
-    """
-    Load 3D OASIS dataset.
+                fixed_arr = zscore_normalize(fixed_matched_nib).get_fdata()
+                moving_arr = zscore_normalize(moving_matched_nib).get_fdata()
 
-    Args:
-        max_subjects: Maximum number of subjects to load
-        data_pattern: Pattern for data files (optional)
+                fixed_tensor = torch.from_numpy(fixed_arr).unsqueeze(0).unsqueeze(0)
+                moving_tensor = torch.from_numpy(moving_arr).unsqueeze(0).unsqueeze(0)
 
-    Returns:
-        Tuple of (dataset_A, dataset_B) as torch tensors
-    """
-    print(f"Loading 3D OASIS data (max {max_subjects} subjects)...")
+                # Pad or crop instead of interpolate
+                fixed_crop_pad_tensor = self.pad_or_crop_center(fixed_tensor, self.target_shape, pad_value=0).squeeze(1).to(torch.float32)
+                moving_crop_pad_tensor = self.pad_or_crop_center(moving_tensor, self.target_shape, pad_value=0).squeeze(1).to(torch.float32)
 
-    dataset_A = []
-    dataset_B = []
-    count = 0
+                torch.save(fixed_crop_pad_tensor, preproc_fixed_path)
+                torch.save(moving_crop_pad_tensor, preproc_moving_path)
 
-    base_path = '/path-to-OASIS'
-    if data_pattern:
-        base_path = str(Path(data_pattern).parent.parent)
+            return {'fixed_arr': fixed_crop_pad_tensor, 'moving_arr': moving_crop_pad_tensor}
 
-    for i in range(1, 458):
-        if count >= max_subjects:
-            break
+        elif self.mode == 'val':
+            if fixed_seg_arr is None:
+                fixed_nib = nib_load(self.dset['Fixed path'].iloc[idx])
+                moving_nib = nib_load(self.dset['Moving path'].iloc[idx])
+                fixed_seg_nib = nib_load(self.dset['Fixed seg path'].iloc[idx])
+                moving_seg_nib = nib_load(self.dset['Moving seg path'].iloc[idx])
 
-        norm_path = f'{base_path}/OASIS_OAS1_{i:04}_MR1/aligned_norm.nii.gz'
-        orig_path = f'{base_path}/OASIS_OAS1_{i:04}_MR1/aligned_orig.nii.gz'
+                fixed_matched_nib, fixed_matched_seg_nib, moving_matched_nib, moving_matched_seg_nib = match_nii_images(fixed_nib, moving_nib, fixed_seg_nib, moving_seg_nib)
 
-        if not os.path.exists(norm_path) or not os.path.exists(orig_path):
-            continue
+                fixed_arr = zscore_normalize(fixed_matched_nib).get_fdata()
+                moving_arr = zscore_normalize(moving_matched_nib).get_fdata()
 
-        try:
-            img_A = itk.imread(norm_path)
-            img_B = itk.imread(orig_path)
+                fixed_tensor = torch.from_numpy(fixed_arr).unsqueeze(0).unsqueeze(0)
+                fixed_seg_tensor = torch.from_numpy(fixed_matched_seg_nib.get_fdata()).unsqueeze(0).unsqueeze(0)
+                moving_tensor = torch.from_numpy(moving_arr).unsqueeze(0).unsqueeze(0)
+                moving_seg_tensor = torch.from_numpy(moving_matched_seg_nib.get_fdata()).unsqueeze(0).unsqueeze(0)
 
-            dataset_A.append(torch.from_numpy(np.asarray(img_A))[None])
-            dataset_B.append(torch.from_numpy(np.asarray(img_B))[None])
-            count += 1
+                # Pad or crop instead of interpolate
+                fixed_crop_pad_tensor = self.pad_or_crop_center(fixed_tensor, self.target_shape, pad_value=0).squeeze(1).to(torch.float32)
+                moving_crop_pad_tensor = self.pad_or_crop_center(moving_tensor, self.target_shape, pad_value=0).squeeze(1).to(torch.float32)
+                fixed_seg_crop_pad_tensor = self.pad_or_crop_center(fixed_seg_tensor, self.target_shape, pad_value=0).squeeze(1).to(torch.float32)
+                moving_seg_crop_pad_tensor = self.pad_or_crop_center(moving_seg_tensor, self.target_shape, pad_value=0).squeeze(1).to(torch.float32)
 
-            if count % 50 == 0:
-                print(f"Loaded {count} subjects...")
+                torch.save(fixed_crop_pad_tensor, preproc_fixed_path)
+                torch.save(moving_crop_pad_tensor, preproc_moving_path)
+                torch.save(fixed_seg_crop_pad_tensor, preproc_fixed_seg_path)
+                torch.save(moving_seg_crop_pad_tensor, preproc_moving_seg_path)
 
-        except Exception as e:
-            print(f"Warning: Failed to load subject {i}: {e}")
-            continue
+            return {
+                'fixed_arr': fixed_crop_pad_tensor,
+                'fixed_seg_arr': fixed_seg_crop_pad_tensor,
+                'moving_arr': moving_crop_pad_tensor,
+                'moving_seg_arr': moving_seg_crop_pad_tensor
+            }
 
-    print(f"Successfully loaded {count} subjects")
+        else:
+            raise NotImplementedError(f"Mode is not train/val: {self.mode}")
 
-    # Stack into tensors
-    dataset_A = torch.stack(dataset_A)
-    dataset_B = torch.stack(dataset_B)
-
-    return dataset_A, dataset_B
-
-
-def create_3d_network(config, model, diffusion, input_shape):
+def create_3d_network(config, model, input_shape):
     """Create 3D registration network."""
     # Create base 3D network
     inner_net = wrappers.FunctionFromVectorField(networks.tallUNet2(dimension=3))
@@ -220,12 +198,8 @@ def create_3d_network(config, model, diffusion, input_shape):
         )
 
     # Create loss function
-    if config.loss.type == "NewLNCC3D":
-        loss_fn = losses.NewLNCC3D(
-            diffusion=diffusion,
-            model=model,
-            sigma=config.loss.sigma
-        )
+    if config.loss.type == "DINOFeatureLoss":
+        loss_fn = losses.DINOFeatureLoss(model=model, sigma=config.loss.sigma)
     else:
         loss_fn = losses.LNCC(sigma=config.loss.sigma)
 
@@ -239,118 +213,306 @@ def create_3d_network(config, model, diffusion, input_shape):
     net.assign_identity_map(input_shape)
     return net
 
+def train_3d(net, train_loader, optimizer, device):
+    """Training loop"""
+    net.train()
+    all_loss_total = 0.
+    sim_loss_total = 0.
+    reg_loss_total = 0.
+    for batch in tqdm(train_loader):
+        fixed_img, moving_img = batch['fixed_arr'].to(device), batch['moving_arr'].to(device)
+        optimizer.zero_grad()
+        loss_object = net(fixed_img, moving_img)
+        loss_object.all_loss.backward()
+        optimizer.step()
+        all_loss_total +=loss_object.all_loss.item()
+        sim_loss_total +=loss_object.similarity_loss.item()
+        reg_loss_total +=loss_object.bending_energy_loss.item()
 
-def train_3d(config):
-    """Main 3D training function."""
+    return {
+        'all_loss': all_loss_total/len(train_loader),
+        'sim_loss': sim_loss_total/len(train_loader),
+        'reg_loss': reg_loss_total/len(train_loader)
+    }
+
+def val_3d(net, val_loader, device):
+    """Validation function"""
+    net.eval()
+    all_loss_total = 0.
+    sim_loss_total = 0.
+    reg_loss_total = 0.
+    global_dice_total = 0.
+    avg_dice_total = 0.
+    dices_total = np.zeros(4)
+    with torch.inference_mode(): # Faster than "torch.no_grad()"
+        for batch in tqdm(val_loader):
+            fixed_img, moving_img = batch['fixed_arr'].to(device), batch['moving_arr'].to(device)
+            fixed_seg_img, moving_seg_img = batch['fixed_seg_arr'].to(device).squeeze(0).squeeze(0), batch['moving_seg_arr'].to(device)
+            
+            loss_object = net(fixed_img, moving_img)
+            deformation_field = net.phi_AB_vectorfield.float()
+            warped_moving_seg_img = net.as_function_seg(moving_seg_img.float())(deformation_field).squeeze(0).squeeze(0)
+
+            global_dice, avg_dice, dices = compute_metric(fixed_seg_img.cpu().numpy(), warped_moving_seg_img.cpu().numpy())
+
+            all_loss_total +=loss_object.all_loss.item()
+            sim_loss_total +=loss_object.similarity_loss.item()
+            reg_loss_total +=loss_object.bending_energy_loss.item()
+            global_dice_total += global_dice
+            avg_dice_total += avg_dice
+            dices_total += dices
+    return {
+        'all_loss': all_loss_total/len(val_loader),
+        'sim_loss': sim_loss_total/len(val_loader),
+        'reg_loss': reg_loss_total/len(val_loader),
+        'global_dice': global_dice_total/len(val_loader),
+        'avg_dice': avg_dice_total/len(val_loader),
+        'dices': dices_total/len(val_loader)
+    }
+
+def worker_init_fn(worker_id):
+    """Worker_init_fn for dataloader initialization"""
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+def save_checkpoint(config, net, optimizer, epoch, 
+                    train_all_loss, train_sim_loss, train_reg_loss, 
+                    val_all_loss, val_sim_loss, val_reg_loss, 
+                    global_dice, avg_dice, dices, 
+                    early_stopping_counter, best_val_loss):
+    checkpoint_path = Path(config.output.checkpoint_dir) / f'net_3d_{epoch:04d}.pth'
+    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+
+    # Collect checkpoint data
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': net.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'train_metrics': {
+            'all_loss': train_all_loss,
+            'sim_loss': train_sim_loss,
+            'reg_loss': train_reg_loss
+        },
+        'val_metrics': {
+            'all_loss': val_all_loss,
+            'sim_loss': val_sim_loss,
+            'reg_loss': val_reg_loss,
+            'global_dice': global_dice,
+            'avg_dice': avg_dice,
+            'dices': dices
+        },
+        'config': vars(config) if hasattr(config, '__dict__') else str(config),
+        'seed': 42,
+        'early_stopping_counter': early_stopping_counter,
+        'best_val_loss': best_val_loss
+    }
+
+    torch.save(checkpoint, checkpoint_path)
+    print(f"Checkpoint saved: {checkpoint_path}")
+
+def main(config):
+    """Main function."""
+
+    # Set random seeds for reproducibility
+    SEED = 42
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+    random.seed(SEED)
+
+    # For GPU determinism
+    torch.cuda.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+
+    # Ensure deterministic behavior
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    # (Optional but good practice)
+    os.environ["PYTHONHASHSEED"] = str(SEED)
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # Needed for CUDA >= 10.2 determinism
+
     device = torch.device(config.training.device)
 
     # Load data
-    train_ds = NiftiDataset(config.data.train_dset, mode = 'train')
-    val_ds = NiftiDataset(config.data.val_dset, mode = 'val')
-    train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, num_workers=config.training.num_workers)
-    val_loader = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False, num_workers=config.training.num_workers)
+    input_shape = [1, 1, 224, 192, 160]  # Standard 3D shape
+    # input_shape = [1, 1, 256, 256, 80]  # Standard 3D shape
+    train_ds = NiftiDataset(config.data.train_dset, mode = 'train', target_shape = input_shape[2:])
+    val_ds = NiftiDataset(config.data.val_dset, mode = 'val', target_shape = input_shape[2:])
+    train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, 
+                              num_workers=config.training.num_workers, worker_init_fn=worker_init_fn, 
+                              generator=torch.Generator().manual_seed(SEED))
+    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False,
+                            num_workers=config.training.num_workers, worker_init_fn=worker_init_fn,
+                            generator=torch.Generator().manual_seed(SEED))
 
     # Setup diffusion model
-    print("Setting up diffusion model...")
-    model, diffusion = setup_diffusion_model(config)
-    model = model.eval().to(device)
+    # print("Setting up diffusion model...")
+    # model, diffusion = setup_diffusion_model(config)
+    # model = model.eval().to(device)
+
+    print("Loading DINO-v2 model...")
+    local_repo = Path.home() / ".cache/torch/hub/facebookresearch_dinov2_main"
+    model = torch.hub.load(str(local_repo), 'dinov2_vitg14', source='local')
+    model.eval().to(device)
 
     # Create network
     print("Creating 3D registration network...")
-    input_shape = [1, 1, 224, 192, 160]  # Standard 3D shape
-    net = create_3d_network(config, model, diffusion, input_shape)
+    # net = create_3d_network(config, model, diffusion, input_shape)
+    net = create_3d_network(config, model, input_shape)
     net = net.to(device)
     net.train()
-
     print(f"Network parameters: {sum(p.numel() for p in net.parameters()):,}")
 
     # Setup optimizer
     optimizer = torch.optim.Adam(net.parameters(), lr=config.training.learning_rate)
 
     # Training loop
-    all_loss = []
-    sim_loss = []
-    reg_loss = []
+    train_all_loss = []
+    train_sim_loss = []
+    train_reg_loss = []
+    val_all_loss = []
+    val_sim_loss = []
+    val_reg_loss = []
+    global_dice = []
+    avg_dice = []
+    dices = []
 
-    print(f"Starting training for {config.training.epochs} epochs...")
+    # Search last saved epoch
+    # ckpt_list = glob.glob(os.path.join(config.output.checkpoint_dir, '*.pth'))
+    ckpt_dir = Path(config.output.checkpoint_dir)
+    ckpt_list = [str(f) for f in ckpt_dir.glob("*.pth") if re.search(r'\d+\.pth$', f.name)]
+    if ckpt_list:
+        ckpt_path = sorted(ckpt_list)[-1]
+        resume_epoch = int(ckpt_path.split('_')[-1].split('.')[0])+1
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        net.load_state_dict(ckpt['model_state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        train_all_loss = ckpt['train_metrics']['all_loss']
+        train_sim_loss = ckpt['train_metrics']['sim_loss']
+        train_reg_loss = ckpt['train_metrics']['reg_loss']
+        val_all_loss = ckpt['val_metrics']['all_loss']
+        val_sim_loss = ckpt['val_metrics']['sim_loss']
+        val_reg_loss = ckpt['val_metrics']['reg_loss']
+        global_dice = ckpt['val_metrics']['global_dice']
+        avg_dice = ckpt['val_metrics']['avg_dice']
+        dices = ckpt['val_metrics']['dices']
+
+        early_stopping_counter = ckpt['early_stopping_counter']
+        best_val_loss = ckpt['best_val_loss']
+        print(f'Loaded checkpoint: {ckpt_path}')
+        print(f"Resuming training at epoch: {resume_epoch}/{config.training.epochs}...")
+        print(f'Best validation loss {best_val_loss:.5f}')
+        print(f"Early stopping counter: {early_stopping_counter}/{config.training.early_stopping_patience}")
+    else:
+        print(f"Starting training for {config.training.epochs} epochs...")
+        resume_epoch=1
+        best_val_loss = float('inf')
+        early_stopping_counter = 0.
     print(f"Batch size: {config.training.batch_size}")
-
-    for epoch in range(config.training.epochs):
-        # Sample random batch
-        all_loss_total = 0.
-        sim_loss_total = 0.
-        reg_loss_total = 0.
-        for batch in tqdm(train_loader, desc=f'Running epoch {epoch}'):
-            fixed_img, moving_img = batch['fixed_arr'].to(device), batch['moving_arr'].to(device)
-            optimizer.zero_grad()
-            loss_object = net(fixed_img, moving_img)
-            loss_object.all_loss.backward()
-            optimizer.step()
-            all_loss_total +=loss_object.all_loss.item()
-            sim_loss_total +=loss_object.similarity_loss.item()
-            reg_loss_total +=loss_object.bending_energy_loss.item()
-        # Record losses
-        all_loss.append(all_loss_total/len(train_loader))
-        sim_loss.append(sim_loss_total/len(train_loader))
-        reg_loss.append(reg_loss_total/len(train_loader))
-
-        # Periodic logging
-        print(f"[{epoch}] Total: {all_loss[-1]:.4f}, "
-                f"Sim: {sim_loss[-1]:.4f}, "
-                f"Reg: {reg_loss[-1]:.4f}")
-
-        # Save checkpoint
-        if epoch % config.training.save_every == 0 and epoch > 0:
-            checkpoint_path = Path(config.output.checkpoint_dir) / f'net_3d_{epoch}.pth'
-            torch.save(net.state_dict(), checkpoint_path)
-            print(f"Checkpoint saved: {checkpoint_path}")
-
-    # Save final model
-    final_path = Path(config.output.checkpoint_dir) / 'net_3d_final.pth'
-    torch.save(net.state_dict(), final_path)
-    print(f"Final model saved: {final_path}")
-
-    return {
-        'all_loss': all_loss,
-        'sim_loss': sim_loss,
-        'reg_loss': reg_loss
-    }
-
-
-def main(config):
-    """Main function."""
-
-    # Set random seeds for reproducibility
-    torch.manual_seed(42)
-    np.random.seed(42)
-    random.seed(42)
 
     # Train model
     try:
-        loss_history = train_3d(config)
+        for epoch in range(resume_epoch, config.training.epochs+1):
+            if early_stopping_counter>=config.training.early_stopping_patience:
+                epoch-=1
+                break
+            train_metrics = train_3d(net, train_loader, optimizer, device)
+            val_metrics = val_3d(net, val_loader, device)
+            
+            # Record losses
+            train_all_loss.append(train_metrics['all_loss'])
+            train_sim_loss.append(train_metrics['sim_loss'])
+            train_reg_loss.append(train_metrics['reg_loss'])
+
+            val_all_loss.append(val_metrics['all_loss'])
+            val_sim_loss.append(val_metrics['sim_loss'])
+            val_reg_loss.append(val_metrics['reg_loss'])
+            global_dice.append(val_metrics['global_dice'])
+            avg_dice.append(val_metrics['avg_dice'])
+            dices.append(val_metrics['dices'])
+
+            # Periodic logging
+            print(f"[{epoch}] Train total: {train_all_loss[-1]:.4f}, Sim: {train_sim_loss[-1]:.4f}, Reg: {train_reg_loss[-1]:.4f}")
+            print(f"[{epoch}] Val total: {val_all_loss[-1]:.4f}, Sim: {val_sim_loss[-1]:.4f}, Reg: {val_reg_loss[-1]:.4f}")
+            print(f"[{epoch}] Global dice: {float(global_dice[-1]):.4f}, Avg dice: {float(avg_dice[-1]):.4f}")
+
+            if epoch>30:
+                if best_val_loss > val_all_loss[-1]:
+                    best_val_loss = val_all_loss[-1]
+                    early_stopping_counter = 0
+                    print(f'New best validation loss: {val_all_loss[-1]}')
+                    save_checkpoint(config, net, optimizer, epoch,
+                                train_all_loss, train_sim_loss, train_reg_loss,
+                                val_all_loss, val_sim_loss, val_reg_loss,
+                                global_dice, avg_dice, dices, early_stopping_counter, best_val_loss)
+                else:
+                    early_stopping_counter+=1
+                    print(f'Early stopping {early_stopping_counter}/{config.training.early_stopping_patience}')
+                    if early_stopping_counter>=config.training.early_stopping_patience:
+                        save_checkpoint(config, net, optimizer, epoch,
+                                train_all_loss, train_sim_loss, train_reg_loss,
+                                val_all_loss, val_sim_loss, val_reg_loss,
+                                global_dice, avg_dice, dices, early_stopping_counter, best_val_loss)
+                        print(f"Early stopping triggered at epoch {epoch}")
+                        break
+
+            # Save checkpoint
+            if (epoch % config.training.save_every == 0) or (epoch == config.training.epochs):
+                save_checkpoint(config, net, optimizer, epoch,
+                                train_all_loss, train_sim_loss, train_reg_loss,
+                                val_all_loss, val_sim_loss, val_reg_loss,
+                                global_dice, avg_dice, dices, early_stopping_counter, best_val_loss)
+
+        # Save final model
+        final_path = Path(config.output.checkpoint_dir) / 'net_3d_final.pth'
+        torch.save(net.state_dict(), final_path)
+        print(f"Final model saved: {final_path}")
         print("Training completed successfully!")
 
         # Plot losses if matplotlib available
         try:
-            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-            axes[0].plot(loss_history['all_loss'])
+            _, axes = plt.subplots(1, 3, figsize=(15, 5))
+            axes[0].plot(np.arange(1, epoch+1), train_all_loss, label='Train')
+            axes[0].plot(np.arange(1, epoch+1), val_all_loss, label = 'Val')
             axes[0].set_title('Total Loss')
             axes[0].set_xlabel('Epoch')
             axes[0].grid(True)
+            axes[0].legend()
 
-            axes[1].plot(loss_history['sim_loss'])
+            axes[1].plot(np.arange(1, epoch+1), train_sim_loss, label='Train')
+            axes[1].plot(np.arange(1, epoch+1), val_sim_loss, label = 'Val')
             axes[1].set_title('Similarity Loss')
             axes[1].set_xlabel('Epoch')
             axes[1].grid(True)
+            axes[1].legend()
 
-            axes[2].plot(loss_history['reg_loss'])
+            axes[2].plot(np.arange(1, epoch+1), train_reg_loss, label='Train')
+            axes[2].plot(np.arange(1, epoch+1), val_reg_loss, label = 'Val')
             axes[2].set_title('Regularization Loss')
             axes[2].set_xlabel('Epoch')
             axes[2].grid(True)
+            axes[2].legend()
 
             plt.tight_layout()
-            plt.savefig(Path(config.output.results_dir) / 'training_losses_3d.png')
-            print(f"Loss plot saved to: {config.output.results_dir}/training_losses_3d.png")
+            if config.training.random_weights:
+                fig_path = Path(config.output.results_dir) / 'random_weights_training_losses_3d.png'
+            else:
+                fig_path = Path(config.output.results_dir) / 'training_losses_3d.png'
+            plt.savefig(fig_path)
+            plt.close()
+            print(f"Loss plot saved to: {fig_path}")
+
+            plt.title('Average dice')
+            plt.plot(np.arange(1, epoch+1), avg_dice)
+            plt.xlabel('Epoch')
+            plt.grid(True)
+            if config.training.random_weights:
+                fig_path = Path(config.output.results_dir) / 'random_weights_validation_dice_3d.png'
+            else:
+                fig_path = Path(config.output.results_dir) / 'training_validation_dice_3d.png'
+            plt.savefig(fig_path)
+            print(f"Loss plot saved to: {fig_path}")
 
         except ImportError:
             print("matplotlib not available, skipping loss plot")
@@ -360,10 +522,8 @@ def main(config):
         sys.exit(1)
     except Exception as e:
         print(f"Training failed with error: {e}")
-        import traceback
         traceback.print_exc()
         sys.exit(1)
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Train 3D diffusion registration network',
@@ -371,6 +531,8 @@ if __name__ == "__main__":
                                      )
     parser.add_argument('--config', type=str, default='config/config_3d.yaml',
                         help='Path to configuration YAML file')
+    parser.add_argument('--random-weights', action= 'store_true',
+                        help = 'Runs the network without initializing the diffusion model weights')
     parser.add_argument('--data-root', type=str, default = '/mnt/c/Users/IMAG2/Documents/MATTEO/Data',
                         help='Override data root directory')
     parser.add_argument('--train-dset', type=str, default = './splits/dset_train.csv',
@@ -379,10 +541,14 @@ if __name__ == "__main__":
                         help='Override data root directory')
     parser.add_argument('--test-dset', type=str, default = './splits/dset_test.csv',
                         help='Override data root directory')
-    parser.add_argument('--num-workers', type=int,default=4,
+    parser.add_argument('--num-workers', type=int, default=4,
                         help='Number of workers')
-    parser.add_argument('--epochs', type=int,default=100,
+    parser.add_argument('--epochs', type=int,default=1000,
                         help='Override number of epochs')
+    parser.add_argument('--early-stopping-patience', type=int,default=30,
+                        help='Early stopping patience')
+    parser.add_argument('--save-every', type=int,default=5,
+                        help='Override saving checkpoint frequency')
     parser.add_argument('--lambda-reg', type=float, default=0.5,
                         help='Regularization weight')
     parser.add_argument('--learning-rate', type=float, default=1e-4,
@@ -390,12 +556,14 @@ if __name__ == "__main__":
     parser.add_argument('--loss-type', type=str, default='NewLNCC3D',
                         choices=['NewLNCC3D', 'LNCC'], help='Loss function type')
     args = parser.parse_args()
-
+    
     # Load configuration
     configuration = Config(args.config)
+    os.makedirs(configuration.output.results_dir, exist_ok = True)
 
     # Override config with command line arguments
     configuration.training.epochs = args.epochs
+    configuration.training.save_every = args.save_every
     configuration.loss.lambda_regularization = args.lambda_reg
     configuration.loss.type = args.loss_type
 
@@ -407,17 +575,15 @@ if __name__ == "__main__":
         configuration.data.val_dset = args.val_dset
     if args.test_dset:
         configuration.data.test_dset = args.test_dset
-    if args.num_workers:
-        configuration.training.num_workers = args.num_workers
+    configuration.training.num_workers = args.num_workers
     if args.learning_rate:
         configuration.training.learning_rate = args.learning_rate
     configuration.training.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    # for k1 in configuration.__dict__.keys():
-    #     print(f'{k1}')
-    #     sub_dict = getattr(configuration, k1)
-    #     for k2 in sub_dict.__dict__.keys():
-    #         print(f'\t{k2}: {sub_dict.__dict__[k2]}')
+    configuration.training.random_weights = args.random_weights
+    configuration.training.early_stopping_patience = args.early_stopping_patience
+    if configuration.training.random_weights:
+        configuration.output.checkpoint_dir = 'random_diffusion_weights_' + configuration.output.checkpoint_dir
+    
 
     # Create csv files
     b0_files = glob.glob(os.path.join(args.data_root, 'b0', '*b0.nii.gz'))
@@ -444,7 +610,6 @@ if __name__ == "__main__":
     os.makedirs(os.path.dirname(args.train_dset), exist_ok = True)
     pd.DataFrame(train_dset).to_csv(args.train_dset, index = False)
     pd.DataFrame(val_dset).to_csv(args.val_dset, index = False)
-
 
     print("Starting 3D registration training with:")
     print(f"  Config: {args.config}")

@@ -1,6 +1,7 @@
 import math
 import random
 import torch
+import numpy as np
 import einops
 from guided_diffusion.nn import timestep_embedding
 
@@ -14,8 +15,6 @@ def normalize(image):
     image_centered = image - torch.mean(image, dim_reduce, keepdim=True)
     stddev = torch.sqrt(torch.mean(image_centered**2, dim_reduce, keepdim=True))
     return image_centered / stddev
-
-
 
 class SimilarityBase:
     def __init__(self, isInterpolated=False):
@@ -81,7 +80,21 @@ class LNCC(SimilarityBase):
                 * (torch.relu(self.blur(J * J) - self.blur(J) ** 2) + 0.00001)
             )
         )
-    
+
+class SquaredLNCC(LNCC):
+    def __call__(self, image_A, image_B):
+        I = image_A
+        J = image_B
+        assert I.shape == J.shape, "The shape of image I and J sould be the same."
+
+        return torch.mean(
+            1
+            - ((self.blur(I * J) - (self.blur(I) * self.blur(J)))
+            / torch.sqrt(
+                (torch.relu(self.blur(I * I) - self.blur(I) ** 2) + 0.00001)
+                * (torch.relu(self.blur(J * J) - self.blur(J) ** 2) + 0.00001)
+            ))**2
+        )
 
 class NewLNCC(SimilarityBase):
     def __init__(self, diffusion, model, sigma, eps=1e-6):
@@ -93,7 +106,7 @@ class NewLNCC(SimilarityBase):
 
     def blur(self, tensor):
         return gaussian_blur(tensor, self.sigma * 4 + 1, self.sigma)
-    
+
     def lncc(self, A, B):
         return torch.mean(
             1
@@ -144,7 +157,6 @@ class NewLNCC(SimilarityBase):
                     ft_B = h[image_A.shape[0]:]
                     break
         return self.lncc(ft_A, ft_B)
-    
 
 class NewLNCC3D(SimilarityBase):
     def __init__(self, diffusion, model, sigma, eps=1e-6):
@@ -216,22 +228,6 @@ class NewLNCC3D(SimilarityBase):
                     break
         return self.lncc(ft_A, ft_B)
 
-
-class SquaredLNCC(LNCC):
-    def __call__(self, image_A, image_B):
-        I = image_A
-        J = image_B
-        assert I.shape == J.shape, "The shape of image I and J sould be the same."
-
-        return torch.mean(
-            1
-            - ((self.blur(I * J) - (self.blur(I) * self.blur(J)))
-            / torch.sqrt(
-                (torch.relu(self.blur(I * I) - self.blur(I) ** 2) + 0.00001)
-                * (torch.relu(self.blur(J * J) - self.blur(J) ** 2) + 0.00001)
-            ))**2
-        )
-
 class LNCCOnlyInterpolated(SimilarityBase):
     def __init__(self, sigma):
         super().__init__(isInterpolated=True)
@@ -271,7 +267,6 @@ class LNCCOnlyInterpolated(SimilarityBase):
 
         return torch.mean(lncc_loss)
 
-
 class BlurredSSD(SimilarityBase):
     def __init__(self, sigma):
         super().__init__(isInterpolated=False)
@@ -283,7 +278,6 @@ class BlurredSSD(SimilarityBase):
     def __call__(self, image_A, image_B):
         assert image_A.shape == image_B.shape, "The shape of image_A and image_B sould be the same."
         return torch.mean((self.blur(image_A) - self.blur(image_B)) ** 2)
-
 
 class AdaptiveNCC(SimilarityBase):
     def __init__(self, level=4, threshold=0.1, gamma=1.5, sigma=2):
@@ -611,3 +605,19 @@ class NMI(SimilarityBase):
             return -torch.mean((ent_x + ent_y) / ent_joint)
         else:
             return -torch.mean(ent_x + ent_y - ent_joint)
+
+class DINOFeatureLoss(torch.nn.Module):
+    def __init__(self, model, sigma):
+        super().__init__()
+        self.model = model
+        self.sigma = sigma
+
+    def forward(self, moving, fixed):
+        # Extract DINO features
+        with torch.no_grad():
+            f_moving = self.model(moving)
+            f_fixed = self.model(fixed)
+
+        # Compute feature similarity (e.g., cosine or LNCC)
+        sim = torch.nn.functional.cosine_similarity(f_moving, f_fixed, dim=1)
+        return 1 - sim.mean()

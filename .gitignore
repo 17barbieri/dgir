@@ -1,3 +1,8 @@
 **/*.pt
 **/*.pyc
 logs/*
+preproc_data/*
+checkpoints_3d/*
+**/*.pth
+temp/*
+temp/*
